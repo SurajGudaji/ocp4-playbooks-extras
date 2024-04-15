@@ -1,0 +1,301 @@
+---
+
+- name: Invoke the role check-cluster-health to check cluster status
+  include_role:
+    name: check-cluster-health
+
+- name: Configure CPU Manager of worker node with static policy
+  block:
+    - name: Get the worker node name
+      shell: oc get nodes | grep worker | head -1 | awk '{if ($1 ~ /worker/) print $1}'
+      register: worker_node
+      failed_when: worker_node.stdout_lines|length < 1
+  
+    - name: Label a worker node
+      shell: oc label node {{ worker_node.stdout }} cpumanager=true
+
+    - name: Get the worker MCP name 
+      shell: oc get mcp | grep worker | head -1 | awk '{if ($1 ~ /worker/) print $1}'
+      register: worker_mcp
+      failed_when: worker_mcp.stdout_lines|length < 1
+
+    - name: Label the worker MachineConfigPool
+      shell: oc label machineconfigpool {{ worker_mcp.stdout }} custom-kubelet=cpumanager-enabled
+
+    - name: Create KubeletConfig CRD for the CPU manager with static policy
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: KubeletConfig
+          metadata:
+            name: cpumanager-enabled
+          spec:
+            machineConfigPoolSelector:
+              matchLabels:
+                custom-kubelet: cpumanager-enabled
+            kubeletConfig:
+              cpuManagerPolicy: static 
+              cpuManagerReconcilePeriod: 5s
+
+    - name: Check if the worker mcp is updating
+      shell: oc get machineconfigpool {{ worker_mcp.stdout}} --no-headers | awk '{ print $3 $4 $5 }' | grep -wv TrueFalseFalse | wc -l
+      register: updating_mcp
+      until: updating_mcp.stdout|int > 0
+      retries: 10
+      delay: 30 
+
+    - name: Check if the machine config pool is updated 
+      shell: oc get machineconfigpool --no-headers | awk '{ print $3 $4 $5 }' | grep -wv TrueFalseFalse | wc -l
+      register: unhealthy_mcp
+      until: unhealthy_mcp.stdout|int == 0
+      retries: 10
+      delay: 120
+
+    - fail:
+        msg: "MCP are not in good state"
+      when: unhealthy_mcp.stdout|int != 0
+
+
+- name: Verify Static Policy is configured on worker node
+  block:
+    - name: Create a target namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ tm_namespace }}"
+          spec:
+            targetNamespaces:
+            - "{{ tm_namespace }}"
+
+    - name: Create a pod with guaranteed qos
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-cpumanager
+            namespace: "{{ tm_namespace }}"
+          spec:
+            containers:
+              - name: test-cpumanager
+                image: docker.io/ibmcom/pause-ppc64le:3.1
+                resources:
+                  requests:
+                    cpu: 1
+                    memory: "1G"
+                  limits:
+                    cpu: 1
+                    memory: "1G"
+            nodeSelector:
+              cpumanager: "true"
+  
+    - name: Wait till test-cpumanager pod is in ready state
+      shell: oc get pod -n "{{ tm_namespace }}" test-cpumanager --no-headers | awk '{ print $3 }' | grep -w Running | wc -l
+      register: cpumanager_pod_status
+      until: cpumanager_pod_status.stdout | int == 1
+      retries: 10
+      delay: 20
+      ignore_errors: true
+
+    - fail:
+        msg: "cpumnager pod not in ready state {{ cpumanager_pod_status }}"
+      when: cpumanager_pod_status.stdout|int != 1
+
+    - name: Get containerid of the test-cpumanager pod
+      shell: oc get pods -n "{{ tm_namespace }}" test-cpumanager -o jsonpath='{.status.containerStatuses[0].containerID}'
+      register: container_id
+    
+    - name: Get c-group path for test-cpumanager container
+      set_fact: 
+        cgroup-path: "{{ container_id.stdout | regex_replace('^cri-o://','crio-') + '.scope' }}"
+
+    - name: Check if the test-cpumanager container directory exists under correct kubepods.slice directory
+      shell: ssh -o StrictHostKeyChecking=no core@worker-0 find /host/sys/fs/cgroup/kubepods.slice/ -type d -name {{ container_id }}
+      register: path_to_cgroup
+      ignore_errors: true
+
+    - fail:
+        msg: "test-cpumanager container directory doest not exist in kubepods.slice directory"
+      when: path_to_cgroup.rc|int != 0
+
+    - name: Checkout to  test-cpumanager container c-group directory and verify it has right number of cpuset assigned.
+      shell: ssh -o StrictHostKeyChecking=no core@worker-0 "cd {{ path_to_cgroup }} && for i in `ls cpuset.cpus` ; do echo -n "$i "; cat $i ; done"
+      register: cpus_count
+    
+    - name: Display
+      debug:
+        var: cpus_count.stdout
+
+- name: Pod interaction Secnarios with worker node when the topology manager policy is set to single-numa-node
+  block:
+    - name: Edit the KubeletConfig cpumanager-enabled to set the topology manager policy single-numa-node
+
+    - name: Pod with guaranteed QoS
+      kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: gqos-pod
+          namespace: "{{ tm_namespace }}"
+        spec:
+          containers:
+          - name: gqos
+            image: docker.io/library/nginx:latest
+            resources:
+              limits:
+                memory: "200Mi"
+                cpu: "200m"
+              requests:
+                memory: "200Mi"
+                cpu: "200m"
+          nodeSelector:
+            cpumanager: "true"
+    
+    - name: Wait till pod gqos-pod is in ready state
+      shell: oc get pod -n "{{ tm_namespace }}" gqos-pod --no-headers | awk '{ print $3 }' | grep -w Running | wc -l
+      register: gqos_pod_status
+      until: gq_pod_status.stdout | int == 1
+      retries: 10
+      delay: 10
+      ignore_errors: true
+
+    - fail:
+        msg: "gqos-pod not in ready state {{ gq_pod_status }}"
+      when: gq_pod_status.stdout|int != 1
+
+    - name: Pod with burstable QoS
+      kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: buqos-pod
+          namespace: "{{ tm_namespace }}"
+        spec:
+          containers:
+          - name: buqos
+            image: docker.io/library/nginx:latest
+            resources:
+              limits:
+                memory: "200Mi"
+                cpu: "200m"
+              requests:
+                memory: "100Mi"
+                cpu: "200m"
+          nodeSelector:
+            cpumanager: "true"
+    
+    - name: Wait till pod buqos-pod is in ready state
+      shell: oc get pod buqos-pod -n "{{ tm_namespace }}" --no-headers | awk '{ print $3 }' | grep -w Running | wc -l
+      register: buqos_pod_status
+      until: buqos_pod_status.stdout | int == 1
+      retries: 10
+      delay: 10
+      ignore_errors: true
+
+    - fail:
+        msg: "buqos-pod not in ready state {{ buqos_pod_status }}"
+      when: buqos_pod_status.stdout|int != 1
+
+    - name: Pod with best effort qos
+      kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: beqos-pod
+          namespace: "{{ tm_namespace }}"
+        spec:
+          containers:
+          - name: beqos
+            image: nginx
+            ports:
+            - containerPort: 80
+    
+    - name: Wait till pod nginx is in ready state
+      shell: oc get pod -n "{{ tm_namespace }}" beqos-pod --no-headers | awk '{ print $3 }' | grep -w Running | wc -l
+      register: beqos_pod_status
+      until: beqos_pod_status.stdout | int == 1
+      retries: 10
+      delay: 10
+      ignore_errors: true
+
+    - fail:
+        msg: "beqos_pod not in ready state {{ be_pod_status.stdout }}"
+      when: beqos_pod_status.stdout|int != 1
+
+    - name: Successful Pod admission keep CPU count in pod less than the cpus in 1 NUMA node - 6 CPU.
+      kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: sucess-test
+          namespace: "{{ tm_namespace }}"
+        spec:
+          containers:
+          - name: nginx-test
+            image: nginx
+            resources:
+              limits:
+                memory: "200Mi"
+                cpu: "6"
+              requests:
+                memory: "200Mi"
+                cpu: "6"
+          nodeSelector:
+            cpumanager: "true"
+      
+    - name: Wait till pod sucess-test is in ready state
+      shell: oc get pod -n "{{ tm_namespace }}" sucess-test --no-headers | awk '{ print $3 }' | grep -w Running | wc -l
+      register: sucess-test_pod_status
+      until: sucess-test_pod_status.stdout | int == 1
+      retries: 10
+      delay: 10
+      ignore_errors: true
+
+    - fail:
+        msg: "sucess-test pod not in ready state {{ sucess-test_pod_status }}"
+      when: sucess-test_pod_status.stdout|int != 1
+
+    - name: Failure in admission by setting the CPU request for pod more than the max.
+      kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: failure-test
+          namespace: "{{ tm_namespace }}"
+        spec:
+          containers:
+          - name: nginx-test
+            image: nginx
+            resources:
+              limits:
+                memory: "200Mi"
+                cpu: "12"
+              requests:
+                memory: "200Mi"
+                cpu: "12"
+          nodeSelector:
+            cpumanager: "true"
+      
+    - name: Wait till pod failure-test is in ready state
+      shell: oc get pod -n "{{ tm_namespace }}" failure-test --no-headers | awk '{ print $3 }' | grep -w Pending | wc -l
+      register: failure-test_pod_status
+      until: failure-test_pod_status.stdout | int == 1
+      retries: 10
+      delay: 10
+      ignore_errors: true
+      

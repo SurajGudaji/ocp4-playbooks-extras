@@ -1,0 +1,4 @@
+---
+
+tm_namespace: "topology-manager"
+topology_manager_directory: "/tmp/topology_manager"
