@@ -1,0 +1,201 @@
+---
+
+- name: Pod interaction Secnarios with worker node when the topology manager policy is set to single-numa-node
+  block:
+    - name: Edit the KubeletConfig cpumanager-enabled to set the topology manager policy single-numa-node
+      shell: oc patch kubeletconfig cpumanager-enabled --type='json' -p='[{"op":"add", "path":"/spec/kubeletConfig/topologyManagerPolicy", "value":"single-numa-node"}]'
+
+    - name: Get the worker MCP name 
+      shell: oc get mcp | grep worker | head -1 | awk '{if ($1 ~ /worker/) print $1}'
+      register: worker_mcp
+      failed_when: worker_mcp.stdout_lines|length < 1
+
+    - name: Check if the worker mcp is updating
+      shell: oc get machineconfigpool {{ worker_mcp.stdout}} --no-headers | awk '{ print $3 $4 $5 }' | grep -wv TrueFalseFalse | wc -l
+      register: updating_mcp
+      until: updating_mcp.stdout|int > 0
+      retries: 10
+      delay: 30
+
+    - name: Check if the machine config pool is updated 
+      shell: oc get machineconfigpool --no-headers | awk '{ print $3 $4 $5 }' | grep -wv TrueFalseFalse | wc -l
+      register: unhealthy_mcp
+      until: unhealthy_mcp.stdout|int == 0
+      retries: 10
+      delay: 120
+
+    - fail:
+        msg: "MCP are not in good state"
+      when: unhealthy_mcp.stdout|int != 0
+
+    - name: Pod with guaranteed QoS
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ guranteed_qos_pod_name }}"
+            namespace: "{{ tm_namespace }}"
+          spec:
+            containers:
+            - name: gqos
+              image: docker.io/library/nginx:latest
+              resources:
+                limits:
+                  memory: "200Mi"
+                  cpu: "200m"
+                requests:
+                  memory: "200Mi"
+                  cpu: "200m"
+            nodeSelector:
+              cpumanager: "true"
+
+    - name: Pod with burstable QoS
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ burstable_qos_pod_name }}"
+            namespace: "{{ tm_namespace }}"
+          spec:
+            containers:
+            - name: buqos
+              image: docker.io/library/nginx:latest
+              resources:
+                limits:
+                  memory: "200Mi"
+                  cpu: "200m"
+                requests:
+                  memory: "100Mi"
+                  cpu: "200m"
+            nodeSelector:
+              cpumanager: "true"
+
+    - name: Pod with best effort qos
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ best_effort_qos_pod_name }}"
+            namespace: "{{ tm_namespace }}"
+          spec:
+            containers:
+            - name: beqos
+              image: nginx
+              ports:
+              - containerPort: 80
+
+    - name: Successful Pod admission keep CPU count in pod less than the cpus in 1 NUMA node - 6 CPU.
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ snn_success_pod }}"
+            namespace: "{{ tm_namespace }}"
+          spec:
+            containers:
+            - name: nginx-test
+              image: nginx
+              resources:
+                limits:
+                  memory: "200Mi"
+                  cpu: "6"
+                requests:
+                  memory: "200Mi"
+                  cpu: "6"
+            nodeSelector:
+              cpumanager: "true"
+
+    - name: Wait till pod {{ snn_success_pod }} is in ready state
+      shell: oc get pod -n "{{ tm_namespace }}" {{ snn_success_pod }} --no-headers | awk '{ print $3 }' | grep -w Running | wc -l
+      register: sucess_test_pod_status
+      until: sucess_test_pod_status.stdout | int == 1
+      retries: 10
+      delay: 10
+      ignore_errors: true
+
+    - fail:
+        msg: "{{ snn_success_pod }} pod not in ready state {{ sucess_test_pod_status }}"
+      when: sucess_test_pod_status.stdout|int != 1
+
+    - name: Failure in admission by setting the CPU request for pod more than the max.
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ snn_failure_pod }}"
+            namespace: "{{ tm_namespace }}"
+          spec:
+            containers:
+            - name: nginx-test
+              image: nginx
+              resources:
+                limits:
+                  memory: "200Mi"
+                  cpu: "12"
+                requests:
+                  memory: "200Mi"
+                  cpu: "12"
+            nodeSelector:
+              cpumanager: "true"
+      
+    - name: Reserve CPU's in KubeletConfig
+      shell: oc patch kubeletconfig cpumanager-enabled --type='json' -p='[{"op":"add", "path":"/spec/kubeletConfig/reservedSystemCPUs", "value":"5,6,2"}]' 
+
+    - name: Check if the worker mcp is updating
+      shell: oc get machineconfigpool {{ worker_mcp.stdout}} --no-headers | awk '{ print $3 $4 $5 }' | grep -wv TrueFalseFalse | wc -l
+      register: updating_mcp
+      until: updating_mcp.stdout|int > 0
+      retries: 10
+      delay: 30
+
+    - name: Check if the machine config pool is updated 
+      shell: oc get machineconfigpool --no-headers | awk '{ print $3 $4 $5 }' | grep -wv TrueFalseFalse | wc -l
+      register: unhealthy_mcp
+      until: unhealthy_mcp.stdout|int == 0
+      retries: 10
+      delay: 120
+
+    - fail:
+        msg: "MCP are not in good state"
+      when: unhealthy_mcp.stdout|int != 0
+
+    - name: Pod deployment on reserved CPUs
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ rserved_cpu_test }}"
+          spec:
+            containers:
+            - name: nginx
+              image: nginx
+              resources:
+                limits:
+                  memory: "200Mi"
+                  cpu: "5"
+                requests:
+                  memory: "200Mi"
+                  cpu: "5"
+          nodeSelector:
+            cpumanager: "true"
+  
+    - name: Check created pods
+      shell: oc get pods -n {{ tm_namespace }} -o wide
+      register: test_pods
+
+    - debug:
+      msg: "{{ test_pods.stdout_lines }}"
+  when: cpu_tests
+

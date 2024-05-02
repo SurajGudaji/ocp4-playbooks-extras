@@ -1,4 +1,14 @@
 ---
 
+tm_configure: true
+cpu_tests: false
+memory_tests: false
+guranteed_qos_pod_name: "gqos-pod"
+best_effort_qos_pod_name: "beqos-pod"
+burstable_qos_pod_name: "buqos-pod"
+snn_success_pod: "sucess-test"
+snn_failure_pod: "failure-test"
+rserved_cpu_test: "reserve-cpu-test-pod"
+kubelet_config_name: "cpumanager-enabled"
 tm_namespace: "topology-manager"
 topology_manager_directory: "/tmp/topology_manager"
