@@ -1,0 +1,88 @@
+---
+
+- name: Check if cluster operators and nodes are healthy
+  include_role:
+    name: check-cluster-health
+
+- name: Download operator-sdk
+  get_url:
+    url: "https://github.com/operator-framework/operator-sdk/releases/download/v{{ OPERATOR_SDK_VERSION }}/operator-sdk_linux_ppc64le"
+    dest: /usr/local/bin/operator-sdk
+    mode: '0755'
+
+- name: Install required packages
+  package:
+    name:
+      - docker
+    state: present
+
+- name: Build and push operator images to quay.io
+  block:
+    - name: Create working directory for helm based nginx operator
+      ansible.builtin.file:
+        path: "{{ op_api_dir }}/helm-op"
+        state: directory
+        mode: '0755'
+     
+    - name: Intialize the helm based nginx operator project
+      command: operator-sdk init --plugins=helm --domain=helm.com --group=helm --version=v1 --kind=Nginx
+      args:
+        chdir: "{{ op_api_dir }}/helm-op"
+
+    - name: Build and push Nginx-helm operator image 
+      command: make docker-build docker-push IMG="{{ HELM_OP_IMAGE }}"
+      args:
+        chdir: "{{ op_api_dir }}/helm-op"
+  when: build_operator_image
+    
+- name: Deploy and Validate operator
+  block:
+    - name: Deploy helm based nginx operator 
+      command: make deploy IMG="{{ HELM_OP_IMAGE }}"
+      args:
+        chdir: "{{ op_api_dir }}/helm-op"
+
+    - name: Verify helm based nginx operator 
+      shell: oc get pods -n helm-op-system --no-headers | grep -v "Running\|Completed" | wc -l
+      register: helm_nginx_pods
+      until: helm_nginx_pods.stdout|int == 0 and helm_nginx_pods.stderr == ""
+      retries: 10
+      delay: 10
+
+    - name: Create a instance of Nginx resource
+      command: oc create -f "{{ op_api_dir }}/helm-op/config/samples/helm_v1_nginx.yaml"
+      args:
+        chdir: "{{ op_api_dir }}/helm-op"
+
+    - name: Verify if instance of nginx operator is created sucessfully
+      shell: oc get pods --no-headers | grep -v "Running\|Completed" | grep nginx-sample |wc -l
+      register: nginx_instance_pods
+      until: nginx_instance_pods.stdout|int == 0 and nginx_instance_pods.stderr == ""
+      retries: 10
+      delay: 10  
+  when: deploy_operator
+
+- name: Cleanup
+  block:
+    - name: Delete Nginx instance
+      command: oc delete -f "{{ op_api_dir }}/helm-op/config/samples/helm_v1_nginx.yaml"
+      args:
+        chdir: "{{ op_api_dir }}/helm-op"
+
+    - name: Verify Nginx instance is deleted
+      shell: oc get Nginx nginx-sample --no-headers | wc -l
+      register: nginx_instance
+      until: nginx_instance.stdout|int == 0 and nginx_instance.stderr == ""
+      retries: 10
+      delay: 10
+
+    - name: Operator cleanup
+      command: make undeploy IMG="{{ HELM_OP_IMAGE }}"
+      args:
+        chdir: "{{ op_api_dir }}/helm-op"
+
+    - name: Delete the workspace
+      file:
+        path: "{{ op_api_dir }}"
+        state: "absent"
+  when: op_cleanup

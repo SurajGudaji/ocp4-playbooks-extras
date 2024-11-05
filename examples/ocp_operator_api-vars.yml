@@ -1,0 +1,10 @@
+---
+
+op_api_role_enable: false
+build_operator_image: true
+deploy_operator: false 
+OPERATOR_SDK_VERSION: "1.37.0"
+op_api_dir: "/tmp/operator-api"
+ocp_version: "418"
+quay_username: ""
+HELM_OP_IMAGE: "quay.io/{{quay_username}}/nginx-operator-helm:{{ ocp_version }}"
